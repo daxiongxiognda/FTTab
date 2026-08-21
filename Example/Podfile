@@ -1,0 +1,6 @@
+use_frameworks!
+target 'FTTab_Tests' do
+  pod 'FTTab', :path => '../'
+  
+  
+end
