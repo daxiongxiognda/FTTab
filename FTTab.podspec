@@ -28,10 +28,16 @@ TODO: Add long description of the pod here.
   s.source           = { :git => 'https://github.com/daxiongxiognda/FTTab.git', :tag => s.version.to_s }
   # s.social_media_url = 'https://twitter.com/<TWITTER_USERNAME>'
 
-  s.ios.deployment_target = '10.0'
+  s.ios.deployment_target = '13.0'
 
   s.source_files = 'FTTab/Classes/**/*'
   
+  s.resource_bundles = {
+      'FTTab' => [
+          'FTTab/Assets/**/*.xcassets',   # 图片、颜色
+      ]
+  }
+
   # s.resource_bundles = {
   #   'FTTab' => ['FTTab/Assets/*.png']
   # }
@@ -39,4 +45,7 @@ TODO: Add long description of the pod here.
   # s.public_header_files = 'Pod/Classes/**/*.h'
   # s.frameworks = 'UIKit', 'MapKit'
   # s.dependency 'AFNetworking', '~> 2.3'
+  s.dependency 'RxSwift'
+  s.dependency 'FTTool'
+  s.dependency 'FTBase'
 end
