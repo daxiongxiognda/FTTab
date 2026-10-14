@@ -10,51 +10,115 @@ import RxSwift
 import FTTool
 
 public class TabBar: UITabBar {
-    private let disposeBag = DisposeBag()
+    // MARK: - Public Properties
+    /// TabBar 样式（亮/暗），切换时同步更新配置
     var style: FTTabBarStyle = .light {
         didSet {
-            switch style {
-            case .light:
-                configuration.backgroundBlurStyle = .systemUltraThinMaterialLight
-                // 白色叠加透明度再加 20%：0.3 → 0.5，降低通透感
-                configuration.backgroundColor = UIColor.white.withAlphaComponent(0.5)
-                // 白色主题背景模糊 100%
-                configuration.backgroundBlurIntensity = 1.0
-                configuration.normalTextColor = .black
-                configuration.selectedTextColor = .white
-            case .dark:
-                configuration.backgroundBlurStyle = .systemUltraThinMaterialDark
-                // 黑色叠加透明度加 20%：0.45 → 0.65
-                configuration.backgroundColor = UIColor.black.withAlphaComponent(0.65)
-                // 黑色主题背景模糊 100%
-                configuration.backgroundBlurIntensity = 1.0
-                configuration.normalTextColor = .white
-                configuration.selectedTextColor = .black
-            }
+            guard oldValue != style else { return }
+            applyStyleConfiguration()
             updatePlusAppearance()
             updateAppearance()
             pinSelectionIndicatorToPlus(animated: false)
             setNeedsLayout()
         }
     }
+    
+    /// 对外配置项，修改后立即刷新外观
+    public var configuration: FloatingTabBarConfiguration = FloatingTabBarConfiguration() {
+        didSet { updateAppearance() }
+    }
+    
+    /// 选中回调
     public weak var floatingDelegate: FloatingTabBarDelegate?
+    
+    // MARK: - Internal State
+    /// 所有 item
     var allItems: [FloatingTabItem] = []
+    /// 所有按钮
     var tabButtons: [UIButton] = []
-    private(set) var oldIndex: Int = 0
-    private(set) var selectedIndex: Int = 0
+    /// 配置源（提供图标、位置等）
     var tabConfig: TabConfig?
+    /// 上一次选中的索引
+    private(set) var oldIndex: Int = 0
+    /// 当前选中的索引
+    private(set) var selectedIndex: Int = 0
+    
+    // MARK: - Private Views
+    
+    /// 选中指示器（模糊胶囊）
+    private lazy var selectionIndicatorView: UIVisualEffectView = {
+        let effectView = UIVisualEffectView(effect: nil)
+        effectView.isUserInteractionEnabled = false
+        effectView.layer.cornerRadius = effectView.bounds.height / 2
+        effectView.clipsToBounds = true
+        selectionIndicatorOverlay.frame = effectView.bounds
+        selectionIndicatorOverlay.layer.cornerRadius = effectView.bounds.height / 2
+        effectView.contentView.addSubview(selectionIndicatorOverlay)
+        return effectView
+    }()
+    /// 选中指示器内部的遮罩层（控制深浅）
+    private lazy var selectionIndicatorOverlay: UIView = {
+        let overlay = UIView()
+        overlay.backgroundColor = UIColor.black.withAlphaComponent(0.1)
+        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        return overlay
+    }()
+    
+    
+    /// TabBar 背景模糊视图容器
+    private lazy var backgroundBlurView: UIVisualEffectView = {
+        let view = UIVisualEffectView(effect: nil) // 初始无效果，由 animator 控制
+        view.translatesAutoresizingMaskIntoConstraints = true
+        view.layer.cornerRadius = configuration.cornerRadius
+        view.clipsToBounds = true
+        backgroundColorOverlay.frame = view.bounds
+        view.contentView.addSubview(backgroundColorOverlay)
+        return view
+    }()
+    /// 背景颜色叠加层
+    private lazy var backgroundColorOverlay: UIView = {
+        let overlay = UIView()
+        overlay.backgroundColor = UIColor.white.withAlphaComponent(0.5)
+        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        return overlay
+    }()
+    
+    /// 背景遮罩层 - 在选中区域挖洞
+    private let backgroundMaskLayer: CAShapeLayer = {
+        let layer = CAShapeLayer()
+        layer.fillRule = .evenOdd
+        return layer
+    }()
+    
+    // MARK: - 4. Private Animators（动画器）
+    
+    /// 背景模糊动画器
+    private var backgroundBlurAnimator: UIViewPropertyAnimator?
+    /// 选中模糊动画器
+    private var selectionBlurAnimator: UIViewPropertyAnimator?
+    
+    private let disposeBag = DisposeBag()
+    
+    // MARK: - 5. Init & Deinit
     
     init(configuration: FloatingTabBarConfiguration = FloatingTabBarConfiguration()) {
         self.configuration = configuration
         super.init(frame: .zero)
         
         setUpView()
+        
+        updateAppearance()
     }
     
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
     
+    deinit {
+        safelyCleanupAnimators()
+    }
+    
+    // MARK: - 6. Setup
     private func setUpView() {
         clipsToBounds = false
         layer.masksToBounds = false
@@ -62,17 +126,19 @@ public class TabBar: UITabBar {
         backgroundImage = UIImage()
         isTranslucent = true
         shadowImage = UIImage()
-        
+        //  选中指示器（模糊胶囊）
         addSubview(selectionIndicatorView)
+        // 背景模糊视图
         addSubview(backgroundBlurView)
-
+        // 遮罩挖洞
         backgroundBlurView.layer.mask = backgroundMaskLayer
-
-        updateAppearance()
     }
+    
+    // MARK: - 7. Layout
     
     public override func layoutSubviews() {
         super.layoutSubviews()
+        // 7.1 隐藏系统自带的 UITabBarButton
         for subview in self.subviews {
             let className = NSStringFromClass(subview.classForCoder)
             if className.contains("UITabBarButton") {
@@ -80,29 +146,139 @@ public class TabBar: UITabBar {
                 subview.alpha = 0
             }
         }
+        
+        // 7.2 背景模糊层铺满整个 bounds
+        backgroundBlurView.frame = bounds
+        
+        let index = tabButtons.count
+        guard index > 0 else { return }
+        
+        // 7.3 布局每个 tab 按钮
+        let contentHeight = configuration.tabBarHeight
+        // 左右各 23，中间区域按 item 数等分，每个 item 在槽位内居中（避免加号偏窄导致视觉上靠得更近）
+        let horizontalInset = configuration.horizontalPadding
+        let contentWidth = max(bounds.size.width - horizontalInset * 2, 0)
+        let slotWidth = contentWidth / CGFloat(index)
+        for i in 0..<tabButtons.count {
+            let isPlus = allItems.indices.contains(i) && allItems[i].isPlus
+            let itemSize = isPlus ? plusButtonSize : configuration.tabItemSize
+            let button = tabButtons[i]
+            button.frame = CGRect(
+                x: horizontalInset + slotWidth * CGFloat(i) + (slotWidth - itemSize.width) / 2,
+                y: (contentHeight - itemSize.height) / 2,
+                width: itemSize.width,
+                height: itemSize.height
+            )
+        }
+        
+        let chatIndex = tabConfig?.position(for: .chat) ?? max(index - 2, 0)
+        if tabButtons.indices.contains(chatIndex) {
+            let chatBtn = tabButtons[chatIndex]
+            //badgeView.frame = CGRect(x: chatBtn.frame.midX + 4, y: 5, width: 18, height: 18)
+        }
+        let mallIndex = tabConfig?.position(for: .mall) ?? max(index - 4, 0)
+        if tabButtons.indices.contains(mallIndex) {
+            let btn = tabButtons[mallIndex]
+        }
+        // 7.4 调整层级，确保指示器和按钮在最上层
+        //bringSubviewToFront(badgeView)
+        bringSubviewToFront(selectionIndicatorView)
+        tabButtons.forEach { bringSubviewToFront($0) }
+        // 7.5 布局完成后，把指示器固定到加号位置（无动画）
+        pinSelectionIndicatorToPlus(animated: false)
+        
+        
     }
     
-    //创建5个Button
+    
+    // MARK: - 8. Public Methods
+    /// 设置 items
     func setItems(_ items: [FloatingTabItem], selectedIndex: Int = 0) {
         self.allItems = items
         tabButtons.forEach { $0.removeFromSuperview() }
         tabButtons.removeAll()
-        
+        // 8.1 创建所有按钮
         for (index, item) in items.enumerated() {
             let button = createTabButton(for: item, at: index)
             addSubview(button)
             tabButtons.append(button)
         }
-
+        // 8.2 更新选中状态
         let safeSelectedIndex = items.indices.contains(selectedIndex) ? selectedIndex : 0
         oldIndex = safeSelectedIndex
         self.selectedIndex = safeSelectedIndex
         updateButtonSelectionStates()
         updatePlusAppearance()
+        
+        // 8.3 首次布局无动画
         pinSelectionIndicatorToPlus(animated: false)
         setNeedsLayout()
     }
     
+    // MARK: - 9. Button Factory
+    /// 创建单个 tab 按钮
+    private func createTabButton(for item: FloatingTabItem, at index: Int) -> UIButton {
+        let button = UIButton(type: .custom)
+        button.translatesAutoresizingMaskIntoConstraints = true
+        button.tag = index
+        button.addTarget(self, action: #selector(tabButtonTapped(_:)), for: .touchUpInside)
+        
+        if item.isPlus {
+            // 加号按钮：使用原色图片，tintColor 透明
+            let plusImage = item.icon ?? item.selectedIcon
+            let plusSelected = item.selectedIcon ?? item.icon
+            button.setImage(plusImage, for: .normal)
+            button.setImage(plusSelected, for: .selected)
+            button.tintColor = .clear
+        } else {
+            // 普通按钮：使用原色渲染
+            if let icon = item.icon {
+                button.setImage(icon.withRenderingMode(.alwaysOriginal), for: .normal)
+            }
+            if let selectedIcon = item.selectedIcon {
+                button.setImage(selectedIcon.withRenderingMode(.alwaysOriginal), for: .selected)
+            }
+            button.tintColor = configuration.normalTextColor
+        }
+        // 清空文字（避免 Label 占位）
+        button.setTitle("", for: .normal) // 清空文字（关键：避免 Label 占位）
+        button.titleLabel?.isHidden = true // 隐藏 Label
+        button.titleLabel?.frame = .zero // 强制 Label 尺寸为 0（双重保险）
+        button.imageView?.contentMode = .scaleAspectFit
+        button.adjustsImageWhenHighlighted = false
+        button.adjustsImageWhenDisabled = false
+        
+        button.contentVerticalAlignment = .center
+        button.contentHorizontalAlignment = .center
+        button.imageEdgeInsets = .zero
+        
+        return button
+    }
+    
+    @objc private func tabButtonTapped(_ sender: UIButton) {
+        setSelectedIndex(sender.tag, animated: true)
+    }
+    
+    /// 切换选中项
+    func setSelectedIndex(_ index: Int, animated: Bool) {
+        guard index >= 0 && index < allItems.count else { return }
+        guard index != selectedIndex else { return }
+        
+        
+        
+        oldIndex = selectedIndex
+        selectedIndex = index
+        // 8.4 更新按钮状态和外观
+        updateButtonSelectionStates()
+        updatePlusBackfillAppearance()
+        
+        // 8.5 更新指示器位置（带动画）—— 关键：之前漏了这一步 (注销后，就不更新动画。 相当于取消动画)
+        //updateSelectionIndicator(from: oldIndex, to: index, animated: animated)
+        
+        // 8.6 通知外部
+        floatingDelegate?.floatingTabBar(self, didSelectItemAt: index)
+    }
+    /// 更新所有按钮的选中状态
     private func updateButtonSelectionStates() {
         // 1. 遍历所有 Tab 按钮
         tabButtons.forEach { button in
@@ -125,74 +301,7 @@ public class TabBar: UITabBar {
         }
     }
     
-    //创建tabbar按钮
-    private func createTabButton(for item: FloatingTabItem, at index: Int) -> UIButton {
-        let button = UIButton(type: .custom)
-        button.translatesAutoresizingMaskIntoConstraints = true
-        button.tag = index
-        button.addTarget(self, action: #selector(tabButtonTapped(_:)), for: .touchUpInside)
-
-        if item.isPlus {
-            let plusImage = item.icon ?? item.selectedIcon
-            let plusSelected = item.selectedIcon ?? item.icon
-            button.setImage(plusImage, for: .normal)
-            button.setImage(plusSelected, for: .selected)
-            button.tintColor = .clear
-        } else {
-            if let icon = item.icon {
-                button.setImage(icon.withRenderingMode(.alwaysOriginal), for: .normal)
-            }
-            if let selectedIcon = item.selectedIcon {
-                button.setImage(selectedIcon.withRenderingMode(.alwaysOriginal), for: .selected)
-            }
-            button.tintColor = configuration.normalTextColor
-        }
-
-        button.setTitle("", for: .normal) // 清空文字（关键：避免 Label 占位）
-        button.titleLabel?.isHidden = true // 隐藏 Label
-        button.titleLabel?.frame = .zero // 强制 Label 尺寸为 0（双重保险）
-        button.imageView?.contentMode = .scaleAspectFit
-        button.adjustsImageWhenHighlighted = false
-        button.adjustsImageWhenDisabled = false
-        
-        button.contentVerticalAlignment = .center
-        button.contentHorizontalAlignment = .center
-        button.imageEdgeInsets = .zero
-        
-        return button
-    }
-    @objc private func tabButtonTapped(_ sender: UIButton) {
-        setSelectedIndex(sender.tag, animated: true)
-    }
     
-    func setSelectedIndex(_ index: Int, animated: Bool) {
-        guard index >= 0 && index < allItems.count else { return }
-        layoutSubviews()
-        
-        oldIndex = selectedIndex
-        selectedIndex = index
-        updateButtonSelectionStates()
-        updatePlusBackfillAppearance()
-        floatingDelegate?.floatingTabBar(self, didSelectItemAt: index)
-    }
-
-    private func updatePlusAppearance() {
-        for (index, button) in tabButtons.enumerated() {
-            guard allItems.indices.contains(index), allItems[index].isPlus else { continue }
-            let normalImage = tabConfig?.plusIcon(style: style, isSelected: false)
-                ?? allItems[index].icon
-                ?? allItems[index].selectedIcon
-            let selectedImage = tabConfig?.plusIcon(style: style, isSelected: true)
-                ?? allItems[index].selectedIcon
-                ?? allItems[index].icon
-                ?? normalImage
-            button.setImage(normalImage, for: .normal)
-            button.setImage(selectedImage, for: .selected)
-            button.setImage(selectedImage, for: .highlighted)
-            button.tintColor = .clear
-        }
-        setNeedsLayout()
-    }
     private var plusIndex: Int {
         // 1. 查找第一个 isPlus == true 的项的索引
         if let index = allItems.firstIndex(where: { $0.isPlus }) {
@@ -204,15 +313,42 @@ public class TabBar: UITabBar {
         //    - 否则返回数组中间位置的索引
         return allItems.isEmpty ? 0 : allItems.count / 2
     }
-    
+    /// 加号是否被选中
     private var isPlusSelected: Bool {
         return selectedIndex == plusIndex
     }
-    
+    /// 是否显示加号回填（仅浅色模式）
     private var shouldShowPlusBackfill: Bool {
         style == .light
     }
     
+    /// 加号按钮点击热区始终用完整尺寸；浅色下图标虽小，不能把 button frame 缩成 12x12。
+    private var plusButtonSize: CGSize {
+        configuration.plusItemSize
+    }
+    /// 加号回填尺寸
+    private var plusBackfillSize: CGSize {
+        configuration.plusItemSize
+    }
+    /// 更新加号按钮图标
+    private func updatePlusAppearance() {
+        for (index, button) in tabButtons.enumerated() {
+            guard allItems.indices.contains(index), allItems[index].isPlus else { continue }
+            let normalImage = tabConfig?.plusIcon(style: style, isSelected: false)
+            ?? allItems[index].icon
+            ?? allItems[index].selectedIcon
+            let selectedImage = tabConfig?.plusIcon(style: style, isSelected: true)
+            ?? allItems[index].selectedIcon
+            ?? allItems[index].icon
+            ?? normalImage
+            button.setImage(normalImage, for: .normal)
+            button.setImage(selectedImage, for: .selected)
+            button.setImage(selectedImage, for: .highlighted)
+            button.tintColor = .clear
+        }
+        setNeedsLayout()
+    }
+    /// 将指示器固定到加号位置
     private func pinSelectionIndicatorToPlus(animated: Bool) {
         // 1. 如果不应该显示加号回填，或者按钮数组为空，直接隐藏指示器并重置遮罩
         guard shouldShowPlusBackfill, !tabButtons.isEmpty else {
@@ -230,29 +366,7 @@ public class TabBar: UITabBar {
         // 4. 更新加号回填的外观（颜色、模糊等）
         updatePlusBackfillAppearance()
     }
-    
-    private func createMaskPath(holeFrame: CGRect) -> UIBezierPath {
-        // 1. 安全检查：如果背景模糊视图的宽高为 0，返回一个空路径，避免无效计算
-        guard backgroundBlurView.bounds.width > 0 && backgroundBlurView.bounds.height > 0 else {
-            return UIBezierPath(rect: .zero)
-        }
-        
-        // 2. 创建整个背景的圆角矩形路径（遮罩的基础形状）
-        let fullPath = UIBezierPath(roundedRect: backgroundBlurView.bounds,
-                                    cornerRadius: configuration.cornerRadius)
-        
-        // 3. 如果“洞”的尺寸有效，创建洞的路径并附加到主路径上
-        if holeFrame.width > 0 && holeFrame.height > 0 {
-            let holePath = UIBezierPath(roundedRect: holeFrame,
-                                        cornerRadius: holeFrame.height / 2)
-            fullPath.append(holePath)
-        }
-        
-        // 4. 返回最终路径
-        return fullPath
-    }
-    
-    
+    /// 更新加号回填外观（颜色、模糊）
     private func updatePlusBackfillAppearance() {
         // 1. 只有需要显示加号回填时才继续
         guard shouldShowPlusBackfill else { return }
@@ -272,11 +386,7 @@ public class TabBar: UITabBar {
         // 4. 重新设置选中模糊效果
         setupSelectionBlur()
     }
-    
-    private var plusBackfillSize: CGSize {
-        configuration.plusItemSize
-    }
-    
+    /// 根据目标索引计算并应用指示器的 frame
     private func updateSelectionIndicator(from oldIndex: Int, to newIndex: Int, animated: Bool) {
         // 1. 更新所有按钮的选中状态
         updateButtonSelectionStates()
@@ -440,58 +550,49 @@ public class TabBar: UITabBar {
         backgroundMaskLayer.add(pathAnim, forKey: "maskSpring")
     }
     
-    private lazy var selectionIndicatorView: UIVisualEffectView = {
-        let effectView = UIVisualEffectView(effect: nil)
-        effectView.isUserInteractionEnabled = false
-        effectView.layer.cornerRadius = effectView.bounds.height / 2
-        effectView.clipsToBounds = true
-        selectionIndicatorOverlay.frame = effectView.bounds
-        selectionIndicatorOverlay.layer.cornerRadius = effectView.bounds.height / 2
-        effectView.contentView.addSubview(selectionIndicatorOverlay)
-        return effectView
-    }()
-    /// TabBar 背景模糊视图容器（带遮罩）
-    private lazy var backgroundBlurView: UIVisualEffectView = {
-        let view = UIVisualEffectView(effect: nil) // 初始无效果，由 animator 控制
-        view.translatesAutoresizingMaskIntoConstraints = true
-        view.layer.cornerRadius = configuration.cornerRadius
-        view.clipsToBounds = true
-        backgroundColorOverlay.frame = view.bounds
-        view.contentView.addSubview(backgroundColorOverlay)
-        return view
-    }()
-    private lazy var backgroundColorOverlay: UIView = {
-        let overlay = UIView()
-        overlay.backgroundColor = UIColor.white.withAlphaComponent(0.5)
-        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        return overlay
-    }()
-    private lazy var selectionIndicatorOverlay: UIView = {
-        let overlay = UIView()
-        overlay.backgroundColor = UIColor.black.withAlphaComponent(0.1)
-        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        return overlay
-    }()
-    /// 背景遮罩层 - 在选中区域挖洞
-    private let backgroundMaskLayer: CAShapeLayer = {
-        let layer = CAShapeLayer()
-        layer.fillRule = .evenOdd
-        return layer
-    }()
- 
-    
-    /**
-     CAGradientLayer 是一个轻量级、高性能的渐变绘制工具，通过设置颜色数组和方向即可快速实现从简单到复杂的渐变效果。它不依赖图片资源，完全由代码控制，非常适合在需要动态调整颜色或尺寸的场景中使用
-     */
-    let bgLayer = CAGradientLayer()
-    
-    public var configuration: FloatingTabBarConfiguration = FloatingTabBarConfiguration() {
-        didSet { updateAppearance() }
+    /// 创建遮罩路径：外圈圆角矩形 + 内部挖洞
+    private func createMaskPath(holeFrame: CGRect) -> UIBezierPath {
+        // 1. 安全检查：如果背景模糊视图的宽高为 0，返回一个空路径，避免无效计算
+        guard backgroundBlurView.bounds.width > 0 && backgroundBlurView.bounds.height > 0 else {
+            return UIBezierPath(rect: .zero)
+        }
+        
+        // 2. 创建整个背景的圆角矩形路径（遮罩的基础形状）
+        let fullPath = UIBezierPath(roundedRect: backgroundBlurView.bounds,
+                                    cornerRadius: configuration.cornerRadius)
+        
+        // 3. 如果“洞”的尺寸有效，创建洞的路径并附加到主路径上
+        if holeFrame.width > 0 && holeFrame.height > 0 {
+            let holePath = UIBezierPath(roundedRect: holeFrame,
+                                        cornerRadius: holeFrame.height / 2)
+            fullPath.append(holePath)
+        }
+        
+        // 4. 返回最终路径
+        return fullPath
     }
     
+    /// 根据 style 应用配置
+    private func applyStyleConfiguration() {
+        switch style {
+        case .light:
+            configuration.backgroundBlurStyle = .systemUltraThinMaterialLight
+            configuration.backgroundColor = UIColor.white.withAlphaComponent(0.5)
+            configuration.backgroundBlurIntensity = 1.0
+            configuration.normalTextColor = .black
+            configuration.selectedTextColor = .white
+        case .dark:
+            configuration.backgroundBlurStyle = .systemUltraThinMaterialDark
+            configuration.backgroundColor = UIColor.black.withAlphaComponent(0.65)
+            configuration.backgroundBlurIntensity = 1.0
+            configuration.normalTextColor = .white
+            configuration.selectedTextColor = .black
+        }
+    }
+    /// 刷新外观
     private func updateAppearance() {
         layer.shadowOpacity = 0
-                
+        
         backgroundBlurView.layer.cornerRadius = 0
         backgroundBlurView.layer.masksToBounds = true
         backgroundBlurView.layer.borderWidth = 0
@@ -503,11 +604,7 @@ public class TabBar: UITabBar {
         setupSelectionBlur()
     }
     
-    /// 背景模糊动画器
-    private var backgroundBlurAnimator: UIViewPropertyAnimator?
-    /// 选中模糊动画器
-    private var selectionBlurAnimator: UIViewPropertyAnimator?
-    
+    /// 设置背景模糊
     private func setupBackgroundBlur() {
         // 1. 停止之前的动画，并立即完成到当前状态
         backgroundBlurAnimator?.stopAnimation(true)
@@ -562,11 +659,18 @@ public class TabBar: UITabBar {
         //    如果不设置，动画会继续执行到 1.0（完全模糊）
         selectionBlurAnimator?.pausesOnCompletion = true
     }
+    /// 清理动画器
+    private func safelyCleanupAnimators() {
+        backgroundBlurAnimator?.stopAnimation(true)
+        backgroundBlurAnimator?.finishAnimation(at: .current)
+        backgroundBlurAnimator = nil
+        
+        selectionBlurAnimator?.stopAnimation(true)
+        selectionBlurAnimator?.finishAnimation(at: .current)
+        selectionBlurAnimator = nil
+    }
+    
 }
-
-
-
-
 
 public struct FloatingTabItem {
     public let icon: UIImage?
